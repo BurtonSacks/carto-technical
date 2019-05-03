@@ -1,0 +1,157 @@
+---
+title: "Carto Technical Exercise"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r include=FALSE}
+library(readr)
+library(ggplot2)
+library(gridExtra)
+library(plyr)
+library(dplyr)
+library(corrplot)
+library(caret)
+library(Boruta)
+
+march <- read_csv('yellow_tripdata_2017-03.csv') ## read in march
+june <- read_csv('yellow_tripdata_2017-06.csv') ## read in june
+nov <- read_csv('yellow_tripdata_2017-11.csv') ## read in november
+```
+**Overview**  
+*How much should a competitor to Uber and Lyft recommend a passenger tips their driver?*  
+In order to provide an answer to this question, I took a deep dive into historical (March, June, and November 2017) yellow taxi data supplied by the city of New York. The purpose of this is to get insights on the transportation landscape of New York and to start building models to predict tips with the insights gained.  
+  
+**Data**  
+The data had just under 30 million observations of 18 variables, both categorical and numerical. Credit cards (67.9%) and cash (31.4%) accounted for most of the transactions, the remaining 0.7% are either no charge, dispute, or unknown. Basic statistics for the numerical data can be seen below. Trip time was calculated by subtracting the pick-up time from the drop-off time, all other variables were already in the dataset.
+
+
+```{r echo=FALSE, warning=FALSE}
+taxi <- rbind(march, june, nov) ## turn into one large dataframe
+remove(june)
+remove(march)
+remove(nov)
+
+taxi$trip_time <- as.numeric(round((taxi$tpep_dropoff_datetime-taxi$tpep_pickup_datetime)/60,2)) ## calculate trip time in minutes
+
+basics_mean <- as.data.frame(t(as.data.frame(apply(taxi[,c('passenger_count','trip_distance','trip_time','fare_amount','tolls_amount',
+                                                           'mta_tax','improvement_surcharge','tip_amount', 'total_amount')],2,mean))))
+basics_median <- as.data.frame(t(as.data.frame(apply(taxi[,c('passenger_count','trip_distance','trip_time','fare_amount','tolls_amount',
+                                                             'mta_tax','improvement_surcharge','tip_amount', 'total_amount')],2,median))))
+basics_sd <- as.data.frame(t(as.data.frame(apply(taxi[,c('passenger_count','trip_distance','trip_time','fare_amount','tolls_amount','mta_tax','improvement_surcharge','tip_amount', 'total_amount')],2,sd))))
+
+basics <- rbind(round(basics_mean,3), basics_median, basics_sd)
+row.names(basics) <- c('Mean','Median','SD')
+basics
+```
+  
+The plots below show a random subset of 100,000 observations in order to visualize the breakdowns of trips by distance and time. For both plots, outliers (2+ standard deviations away from the mean) have been removed in order to make everything easier to visualize.  
+```{r echo=FALSE, warning=FALSE}
+taxi_small <- sample_n(taxi,100000, replace = FALSE)
+taxi_small_dist <- taxi_small[which(taxi_small$trip_distance < (mean(taxi_small$trip_distance) + (2*sd(taxi_small$trip_distance)))),]
+taxi_small_time <- taxi_small[which(taxi_small$trip_time < (mean(taxi_small$trip_time) + (2*sd(taxi_small$trip_time)))),]
+
+taxi_small_dist$trip_distance_rounded <- round(taxi_small_dist$trip_distance,0)
+p1 <- ggplot(taxi_small_dist, aes(x=`trip_distance_rounded`)) +
+  geom_histogram(aes(fill=trip_distance_rounded), binwidth = .5) +
+  labs(x='Trip Distance (Miles)', y='Count', subtitle='Frequency of trips by distance') +
+  scale_x_continuous(breaks = scales::pretty_breaks(n=10)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n=15))
+
+
+taxi_small_time$trip_time_rounded <- round(taxi_small_time$trip_time,0)
+p2 <- ggplot(taxi_small_time[which(taxi_small_time$trip_time_rounded>=0),],aes(x=`trip_time_rounded`)) +
+  geom_histogram(aes(fill=trip_time_rounded), binwidth = .5) +
+  labs(x='Trip Time (Minutes)', y='Count', subtitle='Frequency of trips by time') +
+  scale_x_continuous(breaks = scales::pretty_breaks(n=10)) +
+  scale_y_continuous(breaks = scales::pretty_breaks(n=15))
+
+grid.arrange(p1,p2)
+```
+The number below shows the average tip percent of all those who tipped. Surprisingly, New Yorkers are better tippers than I expected.
+```{r echo=FALSE}
+taxi <- taxi[-which(taxi$tip_amount == 0),]
+taxi$pre_tip <- taxi$total_amount-taxi$tip_amount
+taxi$`tip_%` <- taxi$tip_amount/taxi$pre_tip
+
+taxi <- taxi[-which(taxi$`tip_%` == Inf),]
+mean(taxi$`tip_%`)
+```
+**Model**  
+The first step to deciding which model to fit to the data was to find out which explanatory variables properly explained some of the variance with my response, the tip amount. I immediately discarded VendorID, pickup and drop off time, store and fwd flag, and total amount. VendorID and store and fwd flag are both factors which have absolutely no impact on tip amount; pickup and drop off time are accounted for with the travel time variable; and total amount is all of the monetary variables, including tip amount, summed. With the remaining numeric variables, I created a correlation plot in order to find which ones mattered.
+```{r echo=FALSE,warning=FALSE}
+taxi_small <- sample_n(taxi,10000, replace = FALSE) ## random sample to test on
+taxi_small <- taxi_small[,-c(1:3,7:10,13,16,17,19,20)] ## remove known unnecessary variables
+
+corrplot(cor(taxi_small),type = 'upper')
+```
+In order to help decide which of the categorical variables are necessary, and also reinforce which of the numeric variables need to be used, I used boruta variable selection. Below are the results from running the boruta variable selection.
+```{r echo=FALSE}
+taxi_small <- sample_n(taxi,8000, replace = FALSE) ## random sample to test on
+taxi_small <- taxi_small[,-c(1:3,7,10,13,16,17)] ## remove known unnecessary variables
+
+bor.results <- Boruta(as.matrix(taxi_small[,-8]),as.matrix(taxi_small[,8]), ## run boruta
+                      maxRuns=101,
+                      doTrace=0)
+
+vars <- split(bor.results$finalDecision,bor.results$finalDecision) 
+confirmed <- names(vars$Confirmed) ## create vector of confirmed explanatory variables
+rejected <- names(vars$Rejected) ## create vector of rejected explanatory variables
+```
+**Confirmed**
+```{r echo=FALSE}
+confirmed
+```
+**Rejected**
+```{r echo=FALSE}
+rejected
+```
+
+I trained a bayesian GLM with 10-fold cross validation on a random sample of 6,000 observations using the above confirmed explanatory variables and then tested it on 2,000 observations. A bayesian GLM was the preferred model for this for two reasons: the computation time is extremely fast (even when using a laptop) and the accuracy was still pretty decent. Those two factors made it the optimal choice over other machine learning techniques.
+```{r echo=FALSE}
+set.seed(3)
+
+taxi_small <- taxi_small[,-which(colnames(taxi_small) %in% rejected)]
+
+index <- createDataPartition(taxi_small$tip_amount, p = .8)[[1]]
+train <- taxi_small[index,]
+test <- taxi_small[-index,]
+
+fitControl <- trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 5,
+                           allowParallel = TRUE)
+
+fit.1 <- train(`tip_amount` ~ .,
+               data = train,
+               method = "bayesglm",
+               trControl = fitControl)
+fit.1
+```
+With an RMSE around ~1.30 and an R-Squared around ~0.75, the bayesian GLM accounts for the majority of the variance. While I would prefer to minimize the RMSE even further, this is a good baseline for a "first draft" model.
+```{r echo=FALSE}
+test$Predict <- round(predict(fit.1, test),2)
+
+test$`Check_%` <- round(1-(test$Predict/test$tip_amount),2)
+test$`Check_$` <- round(test$Predict-test$tip_amount,2)
+```
+The below number is the average difference (in cents) the prediction is from the actual tip amount for all test data.
+```{r echo=FALSE}
+mean(abs(test$`Check_$`))
+```
+A few issues that may come up with this model, is what happens during busy times? For instance, if the client implements something similar to surge pricing during rush hour, the algorithm would still recommend the tip amount of a regular price instead of a surge price. In this case, the best thing to do would be to add a similar multiplier to the tip amount during these specific timeframes.  
+  
+**Next Steps**  
+The next steps in order to increase accuracy would be to turn this into a stacked regression. The possible models to be used for this would be the bayesian GLM, prinicpal component regression, a parallelized random forest, cubist regression, and a gradient boosting machine. The predictions from each of these models would be averaged out to come up with one number derived from all 5 models. While this would be significantly more time consuming, putting the algorithm on a server or spark instance would make this a feasible option.  
+  
+**API**  
+The simplest way to share this in a functioning manner with the client would be to host the actual algorithm on a shiny server (either somewhere in AWS or Azure) to speed up the processing and build a shiny app on top of it; this would be a clean, simple, fast version which could be shared.  
+  
+Another option would be to, once again host it on a server, but then pass it along to a software/front end engineer to build a more traditional GUI.
+
+
+
+
+
+
